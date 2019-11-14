@@ -117,7 +117,7 @@ end
 -- | some s := s
 
 
---–Monomials are now represented by lists, which are thought to be zero extended. Trailing zeros are normalized away. 
+--–Monomials are now represented by lists, which are thought to be zero extended. Trailing zeros are normalized away. (This type should have been parameterised by type for the indeterminates—this mistake made the selection of monomial orders cubersome and reduced a lot the reuseability of the custom pattern matching simplifier tactic skeleton.)
 def monomial := list ℕ
 namespace monomial
 
@@ -455,36 +455,49 @@ lemma mul_sub_is_0{M}[ring M][module K M]{x y O : M}(c: M)(o0: O=0)(h: x=y): O -
 
 lemma combines{M}[add_comm_group M][module K M]{P R O : M}(pr: P-R = O)(o0: O = 0): P = R := by rw(by simp : P = P-R + R);simp[*]
 
+lemma triv_simp{M}[ring M](IisO: (1:M)=0):∀x:M, x=0 := by intro; rw[← one_mul x, IisO, zero_mul]
+
 end proof_building_blocks
 open proof_building_blocks
 
+meta def zero_all(M: expr)(_1_0: expr): expr → tactic unit | e := do
+	E ← infer_type e,
+	if E ≠ M then (childs e).mmap' zero_all else
+		𝔼``(triv_simp %%_1_0 %%e) >>= simp_lemmas.add simp_lemmas.mk >>= simp_target
 
---Compute a Gröbner basis from polynomial equations E and return a reducer suitable for simplify_by that uses the computed basis.
-meta def verifying_reducer[mo][reflected K][r: has_reflect K](M)(E: list expr): tactic(expr → poly K → tactic expr) := do
+
+--Compute a Gröbner basis from non-empty set of polynomial equations E and return a reducer suitable for simplify_by that uses the computed basis.
+meta def verifying_reducer[mo][reflected K][r: has_reflect K](M)(E: list expr): tactic(option(expr → poly K → tactic expr)) := do
 	let test: (expr → ST(poly K)) → _ := test_poly_typed(option.some M),
 	be ← E.mmap⟮p ↦ do e ← infer_type p, match e with `(%%x = %%y) := 𝔼``(%%x - %%y) | _:=sorry end⟯,
 	((B: list(poly K)), vs) ← prepares X' test be,
 	let G := Gröbner_basis_of B,
-~ pe _ ↦ do	
-	--TODO There should be nicer way to keep track of alien subterms. Either variables in polynomials should have arbitrary names (ideal solution) or everything should work inside ST.
-	(P, vs) ← (prepare_loop X' test pe).run vs,
-	let (R, coef) := simplify G P,
-	--R = P + coef•(fⱼ - gⱼ)ⱼ
-	--P - R  =ʳⁱⁿᵍ=  -coef•(fⱼ - gⱼ)ⱼ  = “coef•0” = 0  ⟹ P=R
-	re ← represent_poly M vs R,
-	ce ← coef.mmap(represent_poly M vs),
-	K0is0 ← 𝔼``(rfl : (0:%%(reflect K)) = 0),
-	step2 ← (ce.zip E).mfoldl ⟮prf cb ↦ 𝔼``(@mul_sub_is_0
-		%%(reflect K) infer_instance infer_instance infer_instance infer_instance 
-		%%M infer_instance infer_instance 
-		_ _ _ %%cb.fst %%prf %%cb.snd)⟯ K0is0,
-	`(%%ce_be = %%_) ← infer_type step2,
-	ring_step ← prove_by`[{ring}] (𝔼``(%%pe - %%re = %%ce_be)),
-	𝔼``(@combines 
-		%%(reflect K) infer_instance infer_instance infer_instance infer_instance 
-		%%M infer_instance infer_instance 
-		_ _ _ %%ring_step %%step2)
-
+	
+	let reducer: expr → poly K → tactic expr := ⟮pe _ ↦ do
+		(P, vs) ← (prepare_loop X' test pe).run vs,
+		let (R, coef) := simplify G P,
+		--R = P + coef•(fⱼ - gⱼ)ⱼ
+		--P - R  =ʳⁱⁿᵍ=  -coef•(fⱼ - gⱼ)ⱼ  = “coef•0” = 0  ⟹ P=R
+		re ← represent_poly M vs R,
+		ce ← coef.mmap(represent_poly M vs),
+		K0is0 ← 𝔼``(rfl : (0:%%(reflect K)) = 0),
+		step2 ← (ce.zip E).mfoldl ⟮prf cb ↦ 𝔼``(@mul_sub_is_0
+			%%(reflect K) infer_instance infer_instance infer_instance infer_instance 
+			%%M infer_instance infer_instance 
+			_ _ _ %%cb.fst %%prf %%cb.snd)⟯ K0is0,
+		`(%%ce_be = %%_) ← infer_type step2,
+		ring_step ← prove_by`[{ring}] (𝔼``(%%pe - %%re = %%ce_be)),
+		𝔼``(@combines 
+			%%(reflect K) infer_instance infer_instance infer_instance infer_instance 
+			%%M infer_instance infer_instance 
+			_ _ _ %%ring_step %%step2)⟯,
+	
+	--Note: E is non-empty and hence G is non-empty.
+	if ¬G.head.fst.is_const then ~ some reducer else do
+	I ← 𝔼``(1:%%M),
+	IisO ← reducer I 1,
+	target >>= zero_all M IisO,
+	~none
 
 meta def exactℚ := `[exact ℚ]
 
@@ -497,7 +510,9 @@ meta def ringa(K:Type. exactℚ)[reflected K][has_reflect K][field K][decidable_
 	B ← local_equations_of_type M,
 	if B=[] then `[ring] else do --Do not fail to preserve composability.
 	reducer ← verifying_reducer M B,
-	simplify_by (X': ℕ → poly K) (test_poly_typed(some M)) reducer,
+	match reducer with none := ~() | some reducer :=
+		simplify_by (X': ℕ → poly K) (test_poly_typed(some M)) reducer
+	end,
 	`[try{ring}]
 
 
@@ -505,6 +520,14 @@ meta def ringa(K:Type. exactℚ)[reflected K][has_reflect K][field K][decidable_
 --Test cases
 instance use_this_order := monomial.deg_lex
 variables{v x y z : ℚ}{f: ℚ→ℚ}
+
+--In algebras over ℚ
+open polynomial
+variables{F: polynomial ℚ}
+--example(_: X² - X - 1 = (0: polynomial ℚ))(_: F = 1-X): F² = F+1 := by ringa
+
+example: (F+1)² = F² + 2⬝F + 1 := by ring
+example: (F+1)² = F² + (2:ℚ)•F + 1 := by ring
 
 --These delegate to ring tactic
 example: (x+y)⬝(x-y) = x² - y² := by ringa
@@ -526,16 +549,10 @@ example(_: x=y): x⬝f(x-y) - y⬝f(x-x) = 0 := by ringa
 example(_: x=y+1): (x-1)⬝f(2⬝x-1) - y⬝f(x² - y²) = 0 := by ringa
 example(_: x²+y² = z²)(_: x^3 + y^3 = z^3)(_: x⬝y = 1): f(x + y + f(2/3)) = f(f(z²) - 2⬝z) := by ringa
 
---In algebras over ℚ
-open polynomial
-example{P: polynomial ℚ}(_: X² - X - 1 = (0: polynomial ℚ))(_: P = 1-X): P² = P+1 := by ringa
-
-
---Is it worth to handle the situation of inconsistent axioms?
+--Inconsistent axioms get special inconsistent treatment.
+example(_: x² = -1)(_: y^3 = -1)(_: x⬝y = 2): x-x = 1 := by ringa
+example(_: x^4 ⬝ y = 1)(_: x ⬝ y^3 = 2)(_: x² + y² = 0): x-x = 1 := by ringa
 example(_: x²+3⬝x+1 = 0)(_: y²+3⬝y+1 = 0)(_: x^5 + y^5 = 0): x-y = 1 := by ringa
-#check ringa
---∛2̅+̅√̅5̅ + ∛2̅-̅√̅5̅ = 1
---example(_: x²=5)(_: y^3 = 2+x)(_: z^3 = 2-x): y+z = 1 := by ringa
 
 end poly
 open poly
